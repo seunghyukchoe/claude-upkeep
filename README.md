@@ -1,14 +1,20 @@
 # claude-upkeep
 
 A maintenance skill for [Claude Code](https://claude.com/claude-code). It audits your local
-install — and tells you the one number nobody thinks to measure: **how many tokens your
-installed skills cost you in every single session, whether or not you use them.**
+install and tells you the two numbers nobody thinks to measure:
 
-Every skill's `name` and `description` is injected into the system prompt on every session,
-used or not. A large skill library is a standing tax you never see in `du` output.
+1. **How many tokens your installed skills and plugins cost you in every single session,
+   whether or not you use them.** Every skill's `name` and `description` — and every enabled
+   plugin's agents, skills, and commands — is injected into the system prompt on every
+   session. A large library is a standing tax you never see in `du` output.
+2. **Which model is actually doing the work.** If your session runs on the top-tier model and
+   every subagent silently inherits it, the orchestrator is typing the boilerplate. The audit
+   shows the spend ratio per model and whether a routing policy exists.
 
-On the machine this was written for: **8,244 tokens → 2,617 tokens per session (−68%)**,
-by archiving 53 skills that `skillUsage` showed had never once been invoked.
+On the machine this was written for: skill descriptions went **8,244 → 2,062 tokens per
+session (−75%)** by archiving 53 never-invoked skills, and the last-session spend sample
+showed the top-tier model carrying **93%** of cost with zero pinned agents — which is what
+the routing templates fix.
 
 ## What it checks
 
@@ -16,14 +22,18 @@ by archiving 53 skills that `skillUsage` showed had never once been invoked.
 |---|---|
 | Skill descriptions injected per session | > 5k tokens |
 | Skills never invoked (from `skillUsage`) | > 50% of installed |
+| Enabled plugins never used (from `pluginUsage`) | any — shown with their per-session token cost and hook count |
 | `session-env/` entries | > 400, or older than 7d |
 | `telemetry/1p_failed_events.*` | present — these never retry |
 | Transcripts older than 60d | present |
 | `.claude.json` entries for deleted directories | any |
 | Hook commands whose target file is missing | any |
 | Hooks on `PreToolUse`/`PostToolUse` with matcher `*` | any — these run on *every tool call* |
-| Plugins enabled but never used | any — each may dial an MCP server at startup |
-| Agent-CLI dot-dirs in `$HOME` untouched > 30d | reported with size |
+| MCP servers dialed at startup but never authorized | any |
+| Routing policy in `~/.claude/CLAUDE.md` | missing |
+| Custom agents without a `model:` pin | any — they inherit the session model |
+| Top-tier model's share of last-session spend | > 80% |
+| Agent-CLI dot-dirs in `$HOME` untouched > 30d | reported with size, tagged `[ai]` |
 
 The last one earns its keep on its own. Every AI CLI you have ever tried left a directory in
 `$HOME` and none of them clean up after themselves.
@@ -41,58 +51,66 @@ config, or run the scripts directly.
 ## Use
 
 ```bash
-bash ~/.claude/skills/claude-upkeep/scripts/audit.sh    # read-only
-bash ~/.claude/skills/claude-upkeep/scripts/prune.sh    # dry run
-bash ~/.claude/skills/claude-upkeep/scripts/prune.sh --apply
+bash ~/.claude/skills/claude-upkeep/scripts/audit.sh              # read-only
+bash ~/.claude/skills/claude-upkeep/scripts/prune.sh              # dry run
+bash ~/.claude/skills/claude-upkeep/scripts/prune.sh --apply      # move stale runtime to Trash
+bash ~/.claude/skills/claude-upkeep/scripts/install-routing.sh    # dry run
+bash ~/.claude/skills/claude-upkeep/scripts/install-routing.sh --apply
 ```
 
 Sample audit output:
 
 ```
-SKILL CONTEXT COST  (injected into every session)
-  72 active skills  ~32977 chars  ~8244 tokens per session
-  never invoked: 60/72
-    adhd, animation-vocabulary, apple-design, banner-design, brand, ...
+PLUGIN CONTEXT COST  (agents + skills + commands of enabled plugins)
+  codex@openai-codex                   ~  363 tokens/session  12 items  3 hooks  used 588x
+  humanize-korean@im-not-ai            ~ 1572 tokens/session  12 items  0 hooks  used 0x  <- NEVER USED
 
-CONFIG HEALTH
-  hook registrations: 16 across 11 events
-   duplicated x10: if [ -f '~/.some-vendor/agent-hooks/claude-hook....
-   fires on EVERY tool call: 2 hook(s) -> ['PostToolUse', 'PreToolUse']
-  .claude.json project entries: 25 (4 pointing at deleted dirs)
-   enabled but never used: some-plugin@some-marketplace
+MODEL ROUTING  (who does the work)
+  settings.json model: opus[1m]   effortLevel: medium
+  ~/.claude/CLAUDE.md: MISSING -> no global routing policy; every Agent call inherits the session model
+  custom agents (~/.claude/agents): 0   without model pin: 0
+  last-session spend by model (one session per project; a sample, not a total):
+   claude-fable-5                       6 sess  $  139.17    93%     497,743 out-tok
+   claude-sonnet-5                      2 sess  $    8.70     6%      30,366 out-tok
+   top-tier model carries 93% of spend -> route execution to opus/sonnet agents
 ```
 
-## Safety
+## Model routing
 
-`prune.sh` **never calls `rm`.** Everything moves to `~/.Trash/claude-upkeep-<date>/` and stays
-recoverable until you empty the Trash yourself.
+The expensive model should orchestrate — decide, delegate, verify — and cheaper models
+should execute. `install-routing.sh` puts three things in place:
 
-Never touched, by design:
+- **A marked block in `~/.claude/CLAUDE.md`** (`<!-- claude-upkeep:routing -->`) with the
+  rules: who does what, never spawn the top-tier model, delegate anything that is neither
+  tiny nor genuinely hard, effort by task, standalone delegation prompts, verify before
+  reporting. Re-running replaces the block in place; the rest of the file is untouched.
+- **Five pinned agents** in `~/.claude/agents/`:
 
-- `settings.json`, `skills/`, `plugins/` — config is yours to change deliberately
-- transcripts newer than 60 days — that is your live `/resume` history
-- `.claude.json` — the running app rewrites it on exit, so edits during a session get
-  clobbered. Prune its orphan entries only with Claude Code closed.
+  | Agent | Model · effort | Job |
+  |---|---|---|
+  | `scout` | sonnet · low | read-only recon: where is X, how does Y work |
+  | `worker` | sonnet · medium | bounded, well-specified edits, tests, docs, scripts |
+  | `implementer` | opus · high | a feature or fix from a spec, multi-file |
+  | `planner` | opus · high | read-only implementation plan for the orchestrator to approve |
+  | `reviewer` | opus · high | read-only bug review of a diff before final acceptance |
 
-Skill archiving is deliberately **not** automated. It is a `mv` into `~/.claude/skills-archive/`,
-which Claude Code does not load, and it is reversed by moving the directory back. Archive
-dormant *clusters* whole — pulling three of eight `gsap-*` skills leaves cross-references
-dangling.
+  Edited agent files are kept unless you pass `--force`; originals then go to Trash.
+- **A reminder to set `CLAUDE_CODE_SUBAGENT_MODEL`** in `settings.json` — the script does
+  not edit that file. With it set to `sonnet`, every unpinned Agent call, agent-team teammate,
+  and workflow agent stops inheriting the session model:
 
-## Cadence
+  ```json
+  "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet" }
+  ```
 
-Monthly. To automate the read-only half:
+Resolution order, per the Claude Code docs: per-call `model` > agent frontmatter `model:` >
+`CLAUDE_CODE_SUBAGENT_MODEL` > session model.
 
-```bash
-/loop 30d bash ~/.claude/skills/claude-upkeep/scripts/audit.sh
-```
+## What prune never touches
 
-Keep `prune` manual.
-
-## Compatibility
-
-macOS and Linux. Requires `bash`, `python3`, and GNU or BSD `stat` (both are handled).
-Written against Claude Code's `~/.claude` layout as of 2026-08.
+`settings.json`, `skills/`, `plugins/`, `.claude.json`, and any transcript newer than 60 days
+(that is your `/resume` history). Everything it does move goes to
+`~/.Trash/claude-upkeep-<date>/` — nothing is ever `rm`'d.
 
 ## License
 
